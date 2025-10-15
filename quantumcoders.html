@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>AI Text + Image Moderation Chat</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Poppins", sans-serif;
+    background-image: url('wallpaper.jpg');
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+  .chat-container {
+    display: flex;
+    width: 100%;
+    max-width: 1400px;
+    height: 80vh;
+    border: 1px solid #d3d7db;
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 0 20px rgba(0,0,0,0.45);
+  }
+  .window {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 20px;
+    background: #262958;
+    overflow: hidden;
+    position: relative;
+  }
+  .divider { width: 8px; background:#334155; margin:0 6px; }
+  .header { text-align:center; font-weight:700; background:#334155; padding:10px; border-radius:8px; margin-bottom:10px;}
+  .messages { flex:1; overflow-y:auto; padding:12px; background:#0f172a; border-radius:8px; }
+  .message { margin:8px 0; padding:8px 10px; border-radius:8px; max-width:80%; word-wrap:break-word; }
+  .sent { background:#2563eb; align-self:flex-end; }
+  .received { background:#475569; align-self:flex-start; }
+  img.chat-img { max-width:180px; border-radius:6px; display:block; margin-top:6px; }
+  .input-area { display:flex; gap:8px; margin-top:10px; }
+  .input-area input[type="text"] { flex:1; padding:8px; border:none; border-radius:6px; }
+  .input-area button, .input-area input[type="file"] { background:#2563eb; color:#fff; border:none; border-radius:6px; padding:8px 12px; cursor:pointer;}
+  .input-area input[type="file"] { background:#334155; }
+  .blocked { opacity:0.45; pointer-events:none; }
+  .overlay-block {
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    background: rgba(2,6,23,0.75); z-index:40; color:#ffb3b3; font-weight:700; padding:12px;
+  }
+  .scanner-indicator { font-size:0.9rem; color:#ffd54d; margin-left:10px; }
+  .small-meta { font-size:0.8rem; color:#cbd5e1; margin-top:6px; }
+</style>
+</head>
+<body>
+
+<div class="chat-container">
+
+  <div class="window" id="userA">
+    <div class="header">BRAVO</div>
+    <div class="messages" id="msgsA"></div>
+
+    <div class="small-meta" id="metaA">Violations: <span id="vA">0</span></div>
+
+    <div class="input-area" id="inputsA">
+      <input id="textA" type="text" placeholder="Type a message..." />
+      <input id="fileA" type="file" accept="image/*" />
+      <button id="sendA">Send ➤</button>
+      <span class="scanner-indicator" id="scanA" style="display:none">Scanning image...</span>
+    </div>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="window" id="userB">
+    <div class="header">JACK</div>
+    <div class="messages" id="msgsB"></div>
+
+    <div class="small-meta" id="metaB">Violations: <span id="vB">0</span></div>
+
+    <div class="input-area" id="inputsB">
+      <input id="textB" type="text" placeholder="Type a message..." />
+      <input id="fileB" type="file" accept="image/*" />
+      <button id="sendB">Send ➤</button>
+      <span class="scanner-indicator" id="scanB" style="display:none">Scanning image...</span>
+    </div>
+  </div>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
+<script src="https://unpkg.com/nsfwjs@2.4.0/dist/nsfwjs.min.js"></script>
+
+<script>
+// ------------------- Configuration -------------------
+const MAX_ATTEMPTS = 3;
+const NSFW_PROB_THRESHOLD = 0.70; 
+const BLOOD_RATIO_THRESHOLD = 0.02; 
+
+const BAD_WORDS = [
+ 'arsehole','asshat','asshole','bastard','bitch','bloody','bullshit','cock','cocksucker','crap','cunt','dick','dumbass',
+ 'faggot','fuck','shit','slut','whore','wanker'
+];
+
+function normalizeText(text){
+  return text.toLowerCase().replace(/[^a-z\s]/g, '').replace(/([a-z])\1{2,}/g, '$1');
+}
+
+// Basic regex bad-word detection
+const BAD_WORDS_REGEX = [
+  /\bf[\W_]*u[\W_]*c[\W_]*k\b/gi,
+  /\bbitch\b/gi,
+  /\bcunt\b/gi,
+  /\bdick\b/gi,
+  /\bslut\b/gi,
+  /\bwhore\b/gi
+];
+
+// Levenshtein distance
+function levenshtein(a,b){
+  const matrix = Array.from({length:b.length+1}, (_,i)=>Array(a.length+1).fill(0));
+  for(let i=0;i<=b.length;i++) matrix[i][0] = i;
+  for(let j=0;j<=a.length;j++) matrix[0][j] = j;
+  for(let i=1;i<=b.length;i++){
+    for(let j=1;j<=a.length;j++){
+      if(b[i-1] === a[j-1]) matrix[i][j]=matrix[i-1][j-1];
+      else matrix[i][j] = Math.min(matrix[i-1][j]+1, matrix[i][j-1]+1, matrix[i-1][j-1]+1);
+    }
+  }
+  return matrix[b.length][a.length];
+}
+
+// Fuzzy similarity
+function similarity(s1,s2){
+  let longer=s1,shorter=s2;
+  if(s1.length<s2.length)[longer,shorter]=[s2,s1];
+  const longerLen=longer.length;
+  if(longerLen===0)return 1.0;
+  const editDist=levenshtein(longer,shorter);
+  return (longerLen-editDist)/longerLen;
+}
+
+// Text scanning
+function textScan(text){
+  const normalized=normalizeText(text);
+  for(const r of BAD_WORDS_REGEX){ if(r.test(text)) return {verdict:'block', reason:'Regex match'}; }
+  for(const w of BAD_WORDS){ if(normalized.includes(w)) return {verdict:'block', reason:Word: ${w}}; }
+  const words=normalized.split(/\s+/);
+  for(const w of words){ for(const bw of BAD_WORDS){ if(similarity(w,bw)>=0.8) return {verdict:'block', reason:Similar to ${bw}}; } }
+  return {verdict:'allow'};
+}
+
+// ------------------- UI helpers -------------------
+function appendMessage(container, text, cls, imgSrc){
+  const d=document.createElement('div');
+  d.className='message '+cls;
+  if(text){const t=document.createElement('div');t.textContent=text;d.appendChild(t);}
+  if(imgSrc){const im=document.createElement('img');im.className='chat-img';im.src=imgSrc;d.appendChild(im);}
+  container.appendChild(d);
+  container.scrollTop=container.scrollHeight;
+}
+
+function showBlockedOverlay(winEl,msg){
+  const overlay=document.createElement('div');
+  overlay.className='overlay-block';
+  overlay.textContent=msg||'User blocked';
+  winEl.appendChild(overlay);
+}
+
+// ------------------- State -------------------
+let attemptsA=0, attemptsB=0;
+
+// ------------------- Load NSFW Model -------------------
+let nsfwModel=null;
+(async()=>{
+  try{ nsfwModel=await nsfwjs.load(); console.log('NSFW model loaded'); }
+  catch(err){ console.error('Error loading NSFW model:',err); }
+})();
+
+// ------------------- Image scanning -------------------
+function isImageLikelyBlood(imgEl){
+  try{
+    const w=224,h=224;
+    const canvas=document.createElement('canvas');
+    canvas.width=w;canvas.height=h;
+    const ctx=canvas.getContext('2d');
+    ctx.drawImage(imgEl,0,0,w,h);
+    const data=ctx.getImageData(0,0,w,h).data;
+    let bloodCount=0,total=w*h;
+    for(let i=0;i<data.length;i+=4){
+      const r=data[i],g=data[i+1],b=data[i+2];
+      if(r>150&&r>g+40&&r>b+40)bloodCount++;
+    }
+    const ratio=bloodCount/total;
+    return {flag:ratio>=BLOOD_RATIO_THRESHOLD,ratio};
+  }catch(e){return{flag:false,ratio:0};}
+}
+
+async function isImageSafe(imgEl){
+  if(!imgEl)return{safe:true,reasons:[]};
+  const reasons=[];
+  if(nsfwModel){
+    try{
+      const preds=await nsfwModel.classify(imgEl);
+      for(const p of preds){
+        const name=p.className.toLowerCase();
+        if((name.includes('porn')||name.includes('sexy'))&&p.probability>=NSFW_PROB_THRESHOLD){
+          reasons.push(Explicit (${p.className}: ${Math.round(p.probability*100)}%));
+        }
+      }
+    }catch(err){console.warn('NSFW classify failed',err);}
+  }
+  const blood=isImageLikelyBlood(imgEl);
+  if(blood.flag)reasons.push(Blood detected (${(blood.ratio*100).toFixed(2)}%));
+  return {safe:reasons.length===0,reasons};
+}
+
+// ------------------- UI Logic -------------------
+const textA=document.getElementById('textA'),fileA=document.getElementById('fileA'),sendA=document.getElementById('sendA'),inputsA=document.getElementById('inputsA'),msgsA=document.getElementById('msgsA'),metaA=document.getElementById('vA'),scanA=document.getElementById('scanA'),winA=document.getElementById('userA');
+const textB=document.getElementById('textB'),fileB=document.getElementById('fileB'),sendB=document.getElementById('sendB'),inputsB=document.getElementById('inputsB'),msgsB=document.getElementById('msgsB'),metaB=document.getElementById('vB'),scanB=document.getElementById('scanB'),winB=document.getElementById('userB');
+
+async function handleSend({textInput,fileInput,fromMsgs,toMsgs,isA}){
+  const text=textInput.value.trim();
+  const file=fileInput.files[0];
+
+  if(text!==''){
+    const r=textScan(text);
+    if(r.verdict==='block'){
+      if(isA)attemptsA++;else attemptsB++;
+      updateMeta();
+      alert(⚠ Message blocked\nReason: ${r.reason});
+      checkAndBlockUser(isA);
+      return;
+    }
+  }
+
+  if(!file && text==='') return;
+
+  if(file){
+    const indicator=isA?scanA:scanB;
+    const sendBtn=isA?sendA:sendB;
+    indicator.style.display='inline';
+    sendBtn.disabled=true;
+
+    const reader=new FileReader();
+    reader.onload=async(ev)=>{
+      const dataUrl=ev.target.result;
+      const img=new Image();
+      img.src=dataUrl;
+      img.onload=async()=>{
+        const check=await isImageSafe(img);
+        indicator.style.display='none';sendBtn.disabled=false;
+        if(!check.safe){
+          if(isA)attemptsA++;else attemptsB++;
+          updateMeta();
+          alert(🚫 Image blocked\nReason(s):\n- ${check.reasons.join('\n- ')});
+          checkAndBlockUser(isA);
+          return;
+        }
+        appendMessage(fromMsgs,text,'sent',dataUrl);
+        appendMessage(toMsgs,text,'received',dataUrl);
+      };
+    };
+    reader.readAsDataURL(file);
+  } else {
+    appendMessage(fromMsgs,text,'sent');
+    appendMessage(toMsgs,text,'received');
+  }
+  textInput.value='';fileInput.value='';
+}
+
+function updateMeta(){ metaA.textContent=attemptsA; metaB.textContent=attemptsB; }
+
+function checkAndBlockUser(isA){
+  if((isA && attemptsA>=MAX_ATTEMPTS)||(!isA && attemptsB>=MAX_ATTEMPTS)){
+    const inputs=isA?inputsA:inputsB;
+    const win=isA?winA:winB;
+    inputs.classList.add('blocked');
+    showBlockedOverlay(win,'🚫 You have been blocked due to repeated violations');
+  }
+}
+
+sendA.addEventListener('click',()=>handleSend({textInput:textA,fileInput:fileA,fromMsgs:msgsA,toMsgs:msgsB,isA:true}));
+sendB.addEventListener('click',()=>handleSend({textInput:textB,fileInput:fileB,fromMsgs:msgsB,toMsgs:msgsA,isA:false}));
+
+textA.addEventListener('keypress',e=>{if(e.key==='Enter')sendA.click();});
+textB.addEventListener('keypress',e=>{if(e.key==='Enter')sendB.click();});
+</script>
+</body>
+</html>
